@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dobby Plus 2026
 // @namespace    dp2026
-// @version      2.14.4
+// @version      2.17.1
 // @description  The West: silver job finder, job queue automation (selected / automatic), bandit duels, fort battles, XP tracker, sets, energy / motivation / health / XP item handling, optional hotel fallback.
 // @include      https://*.the-west.*/game.php*
 // @include      https://*.tw.innogames.*/game.php*
@@ -116,7 +116,8 @@
     loginBonus: true, autoResume: true,
     pray: { stop: 'manual', hours: 8, count: 100 },
     dep: { amount: 1, delay: 850, stop: 'manual', count: 1000, hours: 1 },
-    wb: { stop: 'manual', hours: 8, count: 100, townName: 'Vizes banditák', town: null, target: 0, residents: [], set: 0 },
+    sched: { kind: 'work-list', h: 1, m: 0 },
+    wb: { stop: 'manual', hours: 8, count: 100, townName: 'Vizes banditák', town: null, target: 0, residents: [], set: 0, buff3: 0, buff1: 0 },
     buildOn: false, buildAfter: 8, buildHours: 1, buildSet: 0, buildBank: true,
     dJob: [1, 4], dSet: [1, 2], dItem: [1, 3],
     autoPick: false, autoPickN: 6, minLp: 0, gold: true, resetHour: 3,
@@ -145,6 +146,7 @@
     if (!['manual', 'hours', 'count'].includes(cfg.pray.stop)) cfg.pray.stop = 'manual'
     cfg.wb = Object.assign({}, DEF.wb, s.wb || {})
     cfg.dep = Object.assign({}, DEF.dep, s.dep || {})
+    cfg.sched = Object.assign({}, DEF.sched, s.sched || {})
     if (!['manual', 'hours', 'count'].includes(cfg.dep.stop)) cfg.dep.stop = 'manual'
     if (!['manual', 'hours', 'count'].includes(cfg.wb.stop)) cfg.wb.stop = 'manual'
     if (!Array.isArray(cfg.wb.residents)) cfg.wb.residents = []
@@ -1832,6 +1834,51 @@
     else if (run.kind === 'duel') duelStart()
     else startRun(run.mode, run)
   }
+  // ===== Timed start: start a chosen bot after the given time (kept over a reload) =====
+  const SCHED_KINDS = ['work-list', 'work-auto', 'duel', 'pray', 'wb', 'dep']
+  let sched = null
+  const schedGet = () => { if (sched === null) { sched = load('sch', null) || false } return sched || null }
+  function schedSet(h, m, kind) {
+    const ms = Math.round((Math.max(0, +h || 0) * 60 + Math.max(0, +m || 0)) * 60000)
+    if (!(ms > 0)) { toast(t('schedNoTime'), true); return }
+    sched = { at: Date.now() + ms, kind: SCHED_KINDS.includes(kind) ? kind : 'work-list' }
+    save('sch', sched)
+    log(t('schedSet', t('schedK_' + sched.kind), clock(sched.at)))
+  }
+  function schedClear(quiet) {
+    sched = false
+    save('sch', null)
+    if (!quiet) log(t('schedCleared'))
+  }
+  function schedTick() {
+    const s0 = schedGet()
+    if (!s0 || Date.now() < s0.at) return
+    if (Date.now() - s0.at > 30 * 60000) { log(t('schedMissed', t('schedK_' + s0.kind), clock(s0.at)), 'w'); schedClear(true); UI.redraw('extra'); return }
+    // a fort battle in progress has priority: try again later
+    if (fortActive()) { if (!s0.waitLog) { s0.waitLog = 1; log(t('schedFortWait'), 'w') } return }
+    schedClear(true)
+    const msg = t('schedTakeover')
+    if (R.on) stopRun(msg)
+    if (D.on) duelStop(msg)
+    if (P.on) prayStop(msg)
+    if (B.on) wbStop(msg)
+    if (K.on) depStop(msg)
+    log(t('schedFire', t('schedK_' + s0.kind)))
+    toast(t('schedFire', t('schedK_' + s0.kind)))
+    const k = s0.kind
+    if (k === 'work-list' || k === 'work-auto') { const mode = k === 'work-auto' ? 'auto' : 'list'; cfg.runMode = mode; saveCfg(); startRun(mode) }
+    else if (k === 'duel') duelStart()
+    else if (k === 'pray') prayStart()
+    else if (k === 'wb') wbStart()
+    else if (k === 'dep') depStart()
+    UI.redraw('extra')
+  }
+  function schedStatusHtml() {
+    const s0 = schedGet()
+    if (!s0) return `<b>${esc(t('lblState'))}</b><span>${esc(t('schedNone'))}</span>`
+    return `<b>${esc(t('lblState'))}</b><span>${esc(t('schedPending', t('schedK_' + s0.kind)))}</span>` +
+      `<b>${esc(t('lblSchedAt'))}</b><span>${esc(clock(s0.at))} (${esc(fmtDur(Math.max(0, (s0.at - Date.now()) / 1000)))})</span>`
+  }
   function heartbeat() {
     const run = load('run', null)
     if (run && (R.on || D.on || P.on || B.on || K.on)) { run.t = Date.now(); if (K.on) { run.done = K.done; run.sum = K.sum; run.startedAt = K.startedAt } if (P.on) { run.added = P.added; run.startedAt = P.startedAt } if (B.on) { run.added = B.added; run.startedAt = B.startedAt } save('run', run) }
@@ -2175,7 +2222,8 @@
       return { n, pcs, total, unknown }
     }
 
-    // eladás
+    // eladás – one piece every SELL_GAP ms (1.1 s was too fast after a while: the server answered with an error)
+    const SELL_GAP = 1600
     let selling = false, running = false, lastInv = 0, prog = '', stopFlag = false
     function progressWindow(total, title) {
       const id = NS + 'fes'
@@ -2289,7 +2337,7 @@
                 endMoney = res.money
               } else itemMoney += it.price || 0
               pw.inc()
-              const wait = 1100 - (Date.now() - t0)
+              const wait = SELL_GAP - (Date.now() - t0)
               if (wait > 0) await sleep(wait)
             }
             if (remaining <= 0) break
@@ -2936,7 +2984,7 @@
     if (c.stop === 'hours') return Date.now() - B.startedAt >= Math.max(0.25, +c.hours || 1) * 3600000
     return false
   }
-  function bSave() { save('run', { kind: 'wb', t: Date.now(), added: B.added, startedAt: B.startedAt }) }
+  function bSave() { save('run', { kind: 'wb', t: Date.now(), added: B.added, startedAt: B.startedAt, fin: B.fin || 0 }) }
   async function wbFindTown(ck) {
     if (cfg.wb.town && cfg.wb.town.id) return cfg.wb.town
     // the name field may also hold coordinates ("14603, 16853")
@@ -2978,7 +3026,7 @@
       const lastEnd = Math.max(G.now() / 1000, ...bEndsLeft())
       const e0 = G.energy()
       const r = await addConfirmed(() => new W.TaskDuel(target.id), isDuelEntry)
-      if (r.ok) { B.ends.push(lastEnd + WB_SEC); return { ok: true } }
+      if (r.ok) { B.ends.push(lastEnd + WB_SEC); B.mine.push(lastEnd + WB_SEC); return { ok: true } }
       if (G.energy() === e0) B.noTask = true
       else return { ok: false, msg: r.msg }
     }
@@ -2987,7 +3035,7 @@
     const x = list && list[0]
     if (!r || r.error || !x || x.error) return { ok: false, msg: (x && x.msg) || (r && (r.msg || r.message)) || '' }
     const tk = x.task || x
-    if (+tk.date_done) B.ends.push(+tk.date_done)
+    if (+tk.date_done) { B.ends.push(+tk.date_done); B.mine.push(+tk.date_done) }
     try { if (r.energy != null && typeof W.Character.setEnergy === 'function') W.Character.setEnergy(+r.energy) } catch (e) {}
     return { ok: true }
   }
@@ -3011,6 +3059,41 @@
       if (G.energy() < WB_EN) { warnOnce(t('wbLowE', G.energy()), 900000); return 'wait' }
     }
     return 'ok'
+  }
+  // two fixed buffs: one after every finished duel (skill points, e.g. dodging), one after every 3rd (damage)
+  const WB_DMG_RE = /sebz|damage|schaden|obrażen|daune|poškozen|dégât|danno|daño/i
+  const WB_PTS_RE = /kitér|célz|lövés|reflex|ütés|szívós|taktik|megjelen|(^|[^a-záéíóöőúüű])erő([^a-záéíóöőúüű]|$)|mozgékony|ügyes|karizm|dodg|aim|shoot|punch|tough|tactic|appear|strength|mobility|dexterity|charisma|ausweich|zielen|schieß|reflex|schlag|zähig|taktik|auftreten/i
+  function wbBuffItems(kind) {
+    return bagList().filter(x => {
+      const ls = lines(x.o)
+      if (x.c <= 0 || !ls.length || NOT_BUFF_RE.test(x.o.name || '')) return false
+      if (REFILLS.some(k => kindVal(x.o, k) != null)) return false
+      if (ls.some(l => CONTAINER_RE.test(l) || JOBTOOL_RE.test(l))) return false
+      return ls.some(l => /\d/.test(l) && (kind === 'dmg' ? WB_DMG_RE.test(l) : (WB_PTS_RE.test(l) && !WB_DMG_RE.test(l))))
+    }).map(x => ({ id: +x.o.item_id, name: x.o.name || ('#' + x.o.item_id), c: x.c })).sort((a, b) => a.name.localeCompare(b.name))
+  }
+  async function wbUseBuff(id, label, ck) {
+    if (!id) return
+    if (bagCount(id) <= 0) { warnOnce(t('wbBuffNone', itemLabel(id)), 1800000); return }
+    const w = cdLeft(id)
+    if (w > 0) { warnOnce(t('wbBuffCd', itemLabel(id), fmtDur(w / 1000)), 300000); return }
+    bSet('item', label)
+    const ok = await useItem(id, 'buff')
+    ck()
+    if (ok) log(t('wbBuffUsed', itemLabel(id), label))
+  }
+  async function wbBuffs(ck) {
+    const c = cfg.wb
+    if (!+c.buff1 && !+c.buff3) return
+    const now = G.now() / 1000
+    const done = (B.mine || []).filter(x => x <= now).length
+    if (!done) return
+    B.mine = B.mine.filter(x => x > now)
+    let every = false, third = false
+    for (let i = 0; i < done; i++) { B.fin = (B.fin || 0) + 1; every = true; if (B.fin % 3 === 0) third = true }
+    bSave()
+    if (every && +c.buff1) await wbUseBuff(+c.buff1, t('wbBuffL1'), ck)
+    if (third && +c.buff3) await wbUseBuff(+c.buff3, t('wbBuffL3'), ck)
   }
   async function wbStep(ck) {
     const c = cfg.wb
@@ -3044,6 +3127,7 @@
       log(t('wbReady', town.name || ''))
       return
     }
+    await wbBuffs(ck)
     const queued = bQueued()
     if (bLimit()) {
       if (!queued) { wbStop(t('wbDone', fmt(B.added))); return }
@@ -3107,9 +3191,10 @@
     if (R.on || D.on || P.on || K.on) { toast(t('stopFirst'), true); return }
     if (fortBusy()) { toast(t('fortBusy'), true); return }
     if (!gear.length) await loadGear()
-    Object.assign(B, { on: true, busy: false, walk: null, ends: [], wait: 0, errors: 0, bad: {}, ready: false, resChecked: false })
+    Object.assign(B, { on: true, busy: false, walk: null, ends: [], mine: [], wait: 0, errors: 0, bad: {}, ready: false, resChecked: false })
     B.gen++
     B.added = restore ? +restore.added || 0 : 0
+    B.fin = restore ? +restore.fin || 0 : 0
     B.startedAt = restore ? +restore.startedAt || Date.now() : Date.now()
     bSet('idle')
     bSave()
@@ -3133,7 +3218,8 @@
       if (Date.now() - B.since > 240000) { B.gen++; B.busy = false; log(t('watchdog'), 'w') }
       return
     }
-    if (B.wait > Date.now()) return
+    // a finished duel wakes the bot at once, so the buffs come right after it
+    if (B.wait > Date.now() && !((cfg.wb.buff1 || cfg.wb.buff3) && (B.mine || []).some(x => x <= G.now() / 1000))) return
     B.busy = true
     B.since = Date.now()
     const g = B.gen
@@ -3467,9 +3553,17 @@
     warnOnce(msg, 900000)
     dWaitFor(60000, 'regen', '')
   }
+  // "Ez az ellenfél még nem áll készen" – the bandit is not there yet: ask again every 2 seconds, never counted as an error
+  const NOT_READY_RE = /nem áll készen|not ready|noch nicht bereit|nie jest jeszcze gotow|nu este (încă )?pregătit|ještě není připraven/i
   function duelError(r) {
-    D.errors++
     const msg = String((r && (r.msg || r.message)) || '')
+    if (NOT_READY_RE.test(msg)) {
+      if (!D.notReady) log(t('duelNotReadyLog', msg))
+      D.notReady = (D.notReady || 0) + 1
+      dWaitFor(2000, 'wait', t('duelNotReady', D.notReady))
+      return
+    }
+    D.errors++
     if (D.errors >= 5) { duelStop(t('duelTooMany', msg), true); return }
     const ms = Math.min(15000 * D.errors, 120000)
     log(t('duelErr', msg || '—', fmtDur(ms / 1000)), 'w')
@@ -3494,7 +3588,8 @@
       if (!r.used) await duelWaitLow(r, t('duelLowE', G.ePct()), ck)
       return
     }
-    if (+dc.motAt > 0 && mot != null && mot <= +dc.motAt) {
+    // a won duel costs 2 motivation: act before the duel that would take it below the limit (60 → never under 65)
+    if (+dc.motAt > 0 && mot != null && mot - 2 < +dc.motAt) {
       const r = await duelRefill('duel', ck)
       if (r.used) return
       if (dc.motOut === 'stop') { duelStop(t('duelMotStop', mot)); return }
@@ -3531,6 +3626,7 @@
     ck()
     if (!r || r.error) return duelError(r)
     D.errors = 0
+    D.notReady = 0
     const res = r.duel_result || {}
     const won = !!res.attacker_won || res.winner === 'attacker'
     D.counter++
@@ -3555,6 +3651,7 @@
     D.busy = false
     D.wait = 0
     D.errors = 0
+    D.notReady = 0
     dstats.s = { duels: 0, wins: 0, xp: 0 }
     dSet('idle')
     log(t('duelStarted'))
@@ -3735,8 +3832,8 @@ ${P}-card>h3{margin:0;padding:6px 10px;font-size:13px;color:#fbecc8;background:l
 ${P}-card>h3 .${NS}-badge{margin-left:auto;font-size:10px;font-weight:normal;padding:1px 8px;border-radius:9px;background:#8c6a3f;color:#fff}
 ${P}-card>h3 .${NS}-badge.on{background:#3d7a2a}
 ${P}-card>.${NS}-cb{padding:8px 10px}
-${P}-pst,${P}-bst,${P}-kst{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px;margin-bottom:6px}
-${P}-pst b,${P}-bst b,${P}-kst b{color:#5a3412}
+${P}-pst,${P}-bst,${P}-kst,${P}-sst{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px;margin-bottom:6px}
+${P}-pst b,${P}-bst b,${P}-kst b,${P}-sst b{color:#5a3412}
 ${P}-st,${P}-dst,${P}-fst{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px}
 ${P}-st b,${P}-dst b,${P}-fst b{color:#5a3412}
 ${P}-log{font:11px Consolas,monospace;white-space:pre-wrap;background:rgba(255,252,242,.7);border:1px solid rgba(107,68,35,.35);padding:4px;height:385px;overflow:auto;margin:0}
@@ -3842,7 +3939,7 @@ ${P}-cards>div{border:1px solid rgba(107,68,35,.4);border-radius:5px;padding:5px
       if (!UI.alive()) return
       if (UI.tab === 'duel') UI.root.find(`.${NS}-dst`).html(UI.duelStatusHtml())
       else if (UI.tab === 'fort') UI.root.find(`.${NS}-fst`).html(UI.fortStatusHtml())
-      else if (UI.tab === 'extra') { UI.root.find(`.${NS}-pst`).html(UI.prayStatusHtml()); UI.root.find(`.${NS}-bst`).html(UI.wbStatusHtml()); UI.root.find(`.${NS}-kst`).html(UI.depStatusHtml()) }
+      else if (UI.tab === 'extra') { UI.root.find(`.${NS}-pst`).html(UI.prayStatusHtml()); UI.root.find(`.${NS}-bst`).html(UI.wbStatusHtml()); UI.root.find(`.${NS}-kst`).html(UI.depStatusHtml()); UI.root.find(`.${NS}-sst`).html(schedStatusHtml()) }
       else UI.root.find(`.${NS}-st`).html(UI.statusHtml())
     },
     statusHtml() {
@@ -4516,6 +4613,23 @@ ${P}-cards>div{border:1px solid rgba(107,68,35,.4);border-radius:5px;padding:5px
     r_extra() {
       const box = jq('<div></div>')
       box.append(ui.note(t('extraIntro')))
+      // --- timed start ---
+      const sc = cfg.sched
+      const sb = jq('<div></div>')
+      sb.append(jq(`<div class="${NS}-hint" style="margin-bottom:6px">${esc(t('schedIntro'))}</div>`))
+      sb.append(jq(`<div class="${NS}-sst"></div>`).html(schedStatusHtml()))
+      sb.append(ui.row(t('optSchedKind'), ui.combo(SCHED_KINDS.map(k => [k, t('schedK_' + k)]), sc.kind, v => { sc.kind = v; saveCfg() }, 240)))
+      const tm = jq('<span></span>')
+      tm.append(ui.field(sc.h, v => { sc.h = clamp(Math.floor(num(v, 0)), 0, 168); saveCfg() }, 40))
+      tm.append(`<span> ${esc(t('schedHours'))} </span>`)
+      tm.append(ui.field(sc.m, v => { sc.m = clamp(Math.floor(num(v, 0)), 0, 59); saveCfg() }, 40))
+      tm.append(`<span> ${esc(t('schedMinutes'))}</span>`)
+      sb.append(ui.row(t('optSchedIn'), tm))
+      const sbar = jq(`<div class="${NS}-bar" style="margin-top:6px"></div>`)
+      sbar.append(ui.btn(t(schedGet() ? 'btnSchedReset' : 'btnSchedSet'), () => { schedSet(sc.h, sc.m, sc.kind); UI.redraw('extra') }))
+      if (schedGet()) sbar.append(ui.btn(t('btnSchedClear'), () => { schedClear(); UI.redraw('extra') }))
+      sb.append(sbar)
+      box.append(UI.card('', t('schedTitle'), !!schedGet(), sb))
       // --- prayer ---
       const pc = cfg.pray
       const body = jq('<div></div>')
@@ -4543,6 +4657,9 @@ ${P}-cards>div{border:1px solid rgba(107,68,35,.4);border-radius:5px;padding:5px
       wb.append(ui.row(t('optWbTarget'), ui.combo(tOpts, wc.target || (wc.residents[0] && wc.residents[0].id) || 0, v => { wc.target = +v || 0; saveCfg() }, 220)))
       if (gear.length) wb.append(ui.row(t('roleWb'), ui.combo(setItems(), +wc.set || 0, v => { wc.set = +v || 0; saveCfg() }, 220)))
       else { wb.append(ui.row(t('roleWb'), jq(`<span>${esc(t('loading'))}</span>`))); loadGear().then(ok => { if (ok) UI.redraw('extra') }) }
+      const buffOpts = (kind, cur) => { const l = wbBuffItems(kind); const o = [[0, t('none')], ...l.map(i => [i.id, `${i.name} (${i.c})`])]; if (+cur && !l.some(i => i.id === +cur)) o.push([+cur, `${itemLabel(+cur)} (0)`]); return o }
+      wb.append(ui.row(t('optWbBuff3'), ui.combo(buffOpts('dmg', wc.buff3), +wc.buff3 || 0, v => { wc.buff3 = +v || 0; saveCfg() }, 260)))
+      wb.append(ui.row(t('optWbBuff1'), ui.combo(buffOpts('pts', wc.buff1), +wc.buff1 || 0, v => { wc.buff1 = +v || 0; saveCfg() }, 260)))
       wb.append(ui.row(t('optPrayStop'), ui.combo([['manual', t('prayStopManual')], ['hours', t('prayStopHours')], ['count', t('wbStopCount')]], wc.stop, v => { wc.stop = v; saveCfg(); UI.redraw('extra') }, 220)))
       if (wc.stop === 'hours') wb.append(ui.row(t('optPrayHours'), ui.field(wc.hours, v => { wc.hours = clamp(num(String(v).replace(',', '.'), wc.hours), 0.25, 240); saveCfg() }, 50), ui.hint(t('optPrayHoursHint'))))
       if (wc.stop === 'count') wb.append(ui.row(t('optWbCount'), ui.field(wc.count, v => { wc.count = clamp(Math.round(num(v, wc.count)), 1, 100000); saveCfg() }, 60), ui.hint(t('optWbCountHint', fmtDur(Math.max(1, +wc.count || 1) * WB_SEC), fmt(Math.max(1, +wc.count || 1) * WB_EN)))))
@@ -4793,6 +4910,7 @@ ${P}-cards>div{border:1px solid rgba(107,68,35,.4);border-radius:5px;padding:5px
     setInterval(fcTick, 60000)
     restoreFort()
     setInterval(heartbeat, 60000)
+    setInterval(schedTick, 5000)
     const bonusUntil = Date.now() + 180000
     bonusWindowUntil = bonusUntil
     const bonusIv = setInterval(() => { if (Date.now() > bonusUntil) clearInterval(bonusIv); loginBonus() }, 4000)
@@ -6260,7 +6378,7 @@ tabJobs: 'Jobs', tabItems: 'Items', tabSets: 'Sets', tabCfg: 'Settings', tabStat
     secDuelSets: 'Duel sets', roleDuel: 'Duel set', roleLose: 'Losing set', roleRegen: 'Regeneration set',
     optRegenOn: 'Wear the regeneration set while waiting (bandit cooldown, regeneration)',
     secDuelRefill: 'Health, energy and duel motivation', duelRefillHint: 'Usable items are ticked on the Items tab (Energy, Health, Duel motivation). 0 = off.',
-    optDuelHp: 'Health item at or below (%)', optDuelE: 'Energy item at or below (%)', optDuelMot: 'Motivation item at or below (%)',
+    optDuelHp: 'Health item at or below (%)', optDuelE: 'Energy item at or below (%)', optDuelMot: 'Lowest duel motivation (%) – below it a motivation item is used',
     optDuelMotOut: 'Low motivation and no item', outDuelOn: 'Keep duelling',
     optDuelAuto: 'If no ticked item is usable, use the strongest matching item from the bag',
     secLose: 'Intentional losses', loseHint: 'After the given number of duels the next few are fought in the losing set. The two numbers are saved and kept after a reload (empty = 12 duels, then 4 losses).',
@@ -6270,6 +6388,7 @@ tabJobs: 'Jobs', tabItems: 'Items', tabSets: 'Sets', tabCfg: 'Settings', tabStat
     optDDuel: 'Between duels', duelDelayHint: 'Gear change and item use delays: Settings → Random delays.',
     duelStatLine: '{0} duels · {1} won · {2} XP', lblDuelMot: 'Duel motivation', lblTotal: 'Total', btnResetDuelStats: 'Reset duel statistics',
     dst_idle: 'Idle', dst_fight: 'Duelling', dst_cooldown: 'No bandit available', dst_item: 'Using item', dst_wait: 'Waiting', dst_regen: 'Regenerating', dst_pause: 'Short pause', dst_stopped: 'Stopped',
+    duelNotReady: 'the bandit is not ready yet – again in 2 s (try {0})', duelNotReadyLog: '{0} The bot tries again every 2 seconds.',
     duelStarted: 'Duel bot started.', duelStopped: 'Duel bot stopped.',
     duelWin: '#{0} won: {1}{2}', duelLoss: '#{0} lost: {1}{2}', duelLoseTag: ' (losing set)',
     duelErr: 'Duel error: {0}. Retrying in {1}.', duelErrShort: 'after an error', duelTooMany: 'Too many errors in a row, the duel bot stopped. {0}',
@@ -6319,6 +6438,12 @@ tabJobs: 'Jobs', tabItems: 'Items', tabSets: 'Sets', tabCfg: 'Settings', tabStat
     fcNow: 'running out', fcDays: 'about {0} days {1} hours', fcHours: 'about {0}:{1} hours', fcMin: 'about {0} minutes', fcUntil: 'until about {0}', fcTomorrow: 'tomorrow {0}',
     fcNoTick: 'nothing selected', fcEmpty: 'used up!', fcFewData: 'not enough data yet', fcNoUse: 'not used recently',
     tabSell: 'Trader',
+    schedTitle: 'Timed start', schedIntro: 'Starts the chosen bot after the given time (also after a reload). A bot that is running then is stopped; during a fort battle it waits until the battle is over.',
+    optSchedKind: 'Bot to start', optSchedIn: 'Start in', schedHours: 'h', schedMinutes: 'min', btnSchedSet: 'Set timer', btnSchedReset: 'Set again', btnSchedClear: 'Cancel timer',
+    schedNone: 'no timer set', schedPending: 'waiting: {0}', lblSchedAt: 'Starts at',
+    'schedK_work-list': 'Work (selected jobs)', 'schedK_work-auto': 'Work (automatic)', schedK_duel: 'Bandit duels', schedK_pray: 'Prayer', schedK_wb: 'Vizes banditák duels', schedK_dep: 'Bank deposits',
+    schedNoTime: 'Give a time longer than 0 minutes.', schedSet: 'Timed start set: {0} at {1}.', schedCleared: 'Timed start cancelled.',
+    schedFire: 'Timed start: {0}.', schedTakeover: 'Stopped for the timed start.', schedFortWait: 'Timed start: a fort battle is in progress, it starts after the battle.', schedMissed: 'Timed start skipped ({0}, {1}): the game was not open at that time.',
     tabExtra: 'Extra', extraIntro: 'Small extra helpers. Each one runs on its own – only one bot can run at a time.', badgeOn: 'running', badgeOff: 'off',
     prayTitle: 'Prayer', prayIntro: 'Keeps the job queue full of prayers (15 minutes each) in a church – good for achievement farming. Works in any town; if you are not in one, it walks home first (without an own town: to the nearest town with a church).',
     lblPrayTown: 'Town', lblPrayRun: 'This run', lblPrayGoal: 'Stops', lblPrayTotal: 'All prayers so far',
@@ -6333,6 +6458,8 @@ tabJobs: 'Jobs', tabItems: 'Items', tabSets: 'Sets', tabCfg: 'Settings', tabStat
     optWbTarget: 'Opponent', wbNoList: '— press "Find town" —',
     wbStopCount: 'after some duels', optWbCount: 'Duels', optWbCountHint: 'about {0}, {1} energy', optWbTown: 'Town name',
     wbUsesDuel: 'Health and energy items and their thresholds come from the Duels tab (the items ticked on the Items tab).', roleWb: 'Set for these duels',
+    optWbBuff3: 'Buff after every 3rd duel (damage)', optWbBuff1: 'Buff after every duel (points, e.g. dodging)', wbBuffL3: 'after the 3rd duel', wbBuffL1: 'after the duel',
+    wbBuffUsed: 'Buff used: {0} ({1}).', wbBuffNone: 'The buff is used up: {0}.', wbBuffCd: 'The buff is still on cooldown: {0} ({1}).',
     btnWbStart: '▶ Start duels', btnWbFind: 'Find town', lblWbTarget: 'Opponent', lblWbTotal: 'All duels so far', wbNotFound: 'not found yet', wbGoalCount: '{0} / {1} duels',
     bst_idle: 'Starting', bst_town: 'Looking for the town', bst_walk: 'Walking to the town', bst_duel: 'Duelling', bst_item: 'Using item', bst_regen: 'Waiting for regeneration', bst_wait: 'Waiting', bst_finish: 'Finishing', bst_stopped: 'Stopped',
     wbStarted: 'Bandit town duels started.', wbStopped: 'Bandit town duels stopped.', wbNoTown: 'Town not found on the minimap: {0}.', wbNoResidents: 'No residents found in the bandit town.',
@@ -6610,6 +6737,12 @@ tabJobs: 'Jobs', tabItems: 'Items', tabSets: 'Sets', tabCfg: 'Settings', tabStat
     fcNow: 'mindjárt elfogy', fcDays: 'kb. {0} nap {1} óra', fcHours: 'kb. {0} óra {1} perc', fcMin: 'kb. {0} perc', fcUntil: 'kb. eddig: {0}', fcTomorrow: 'holnap {0}',
     fcNoTick: 'nincs kiválasztás', fcEmpty: 'elfogyott!', fcFewData: 'még kevés az adat', fcNoUse: 'mostanában nem fogyott',
     tabSell: 'Kereskedő',
+    schedTitle: 'Időzített indítás', schedIntro: 'A megadott idő múlva elindítja a kiválasztott botot (újratöltés után is). Ha akkor más bot fut, azt leállítja; erődharc közben megvárja a csata végét.',
+    optSchedKind: 'Melyik bot induljon', optSchedIn: 'Indulás ennyi idő múlva', schedHours: 'óra', schedMinutes: 'perc', btnSchedSet: 'Időzítés beállítása', btnSchedReset: 'Újra beállítás', btnSchedClear: 'Időzítés törlése',
+    schedNone: 'nincs beállítva', schedPending: 'vár: {0}', lblSchedAt: 'Indulás',
+    'schedK_work-list': 'Munka (kiválasztott munkák)', 'schedK_work-auto': 'Munka (automatikus)', schedK_duel: 'Bandita párbaj', schedK_pray: 'Imádkozás', schedK_wb: 'Vizes banditák párbaj', schedK_dep: 'Bankbefizetés',
+    schedNoTime: 'Adj meg 0 percnél hosszabb időt.', schedSet: 'Időzített indítás beállítva: {0}, {1}-kor.', schedCleared: 'Időzített indítás törölve.',
+    schedFire: 'Időzített indítás: {0}.', schedTakeover: 'Leállítva az időzített indítás miatt.', schedFortWait: 'Időzített indítás: erődharc van folyamatban, a csata után indul.', schedMissed: 'Időzített indítás kimaradt ({0}, {1}): a játék akkor nem volt megnyitva.',
     tabExtra: 'Extra', extraIntro: 'Kisebb kiegészítő funkciók. Mindegyik külön fut – egyszerre csak egy bot dolgozhat.', badgeOn: 'fut', badgeOff: 'ki',
     prayTitle: 'Imádkozás', prayIntro: 'A munkasort folyamatosan tele tartja imával (egyenként 15 perc) a templomban – eredményfarmoláshoz. Bármelyik városban működik; ha nem vagy városban, előbb hazasétál (ha nincs saját városod, a legközelebbi lakott, templomos városba megy – szellemvárosba soha).',
     lblPrayTown: 'Város', lblPrayRun: 'Ebben a körben', lblPrayGoal: 'Leáll', lblPrayTotal: 'Összes ima eddig',
@@ -6624,6 +6757,8 @@ tabJobs: 'Jobs', tabItems: 'Items', tabSets: 'Sets', tabCfg: 'Settings', tabStat
     optWbTarget: 'Ellenfél', wbNoList: '— nyomd meg a „Város keresése” gombot —',
     wbStopCount: 'adott számú párbaj után', optWbCount: 'Párbajok száma', optWbCountHint: 'kb. {0}, {1} energia', optWbTown: 'Város neve',
     wbUsesDuel: 'Az életerő- és energiatárgyakat és a küszöböket a Párbaj fülről veszi (a Tárgyak fülön kijelölt tárgyakkal).', roleWb: 'Párbajszett:',
+    optWbBuff3: 'Buff minden 3. párbaj után (sebzés)', optWbBuff1: 'Buff minden párbaj után (pontok, pl. kitérés)', wbBuffL3: '3. párbaj után', wbBuffL1: 'párbaj után',
+    wbBuffUsed: 'Buff használva: {0} ({1}).', wbBuffNone: 'Elfogyott a buff: {0}.', wbBuffCd: 'A buff még újratöltődik: {0} ({1}).',
     btnWbStart: '▶ Párbajok indítása', btnWbFind: 'Város keresése', lblWbTarget: 'Ellenfél', lblWbTotal: 'Összes párbaj eddig', wbNotFound: 'még nincs megkeresve', wbGoalCount: '{0} / {1} párbaj',
     bst_idle: 'Indul', bst_town: 'Várost keres', bst_walk: 'Úton a városba', bst_duel: 'Párbajozik', bst_item: 'Tárgyat használ', bst_regen: 'Visszatöltődésre vár', bst_wait: 'Várakozik', bst_finish: 'Befejezi', bst_stopped: 'Leállítva',
     wbStarted: 'Vizes banditák párbaj elindítva.', wbStopped: 'Vizes banditák párbaj leállítva.', wbNoTown: 'Nem találtam a minitérképen ezt a várost: {0}.', wbNoResidents: 'Nem találtam lakót a bandita városban.',
@@ -6703,7 +6838,7 @@ tabJobs: 'Jobs', tabItems: 'Items', tabSets: 'Sets', tabCfg: 'Settings', tabStat
     secDuelSets: 'Párbajszettek', roleDuel: 'Párbajszett', roleLose: 'Vesztes szett', roleRegen: 'Regenerációs szett',
     optRegenOn: 'Várakozás közben (bandita-cooldown, visszatöltődés) a regenerációs szettet viseli',
     secDuelRefill: 'Életerő, energia és párbajmotiváció', duelRefillHint: 'A használható tárgyakat a Tárgyak fülön pipálhatod be (Energia, Életerő, Párbajmotiváció). 0 = kikapcsolva.',
-    optDuelHp: 'Életerő-tárgy, ha az életerő legfeljebb (%)', optDuelE: 'Energiatárgy, ha az energia legfeljebb (%)', optDuelMot: 'Motivációs tárgy, ha a párbajmotiváció legfeljebb (%)',
+    optDuelHp: 'Életerő-tárgy, ha az életerő legfeljebb (%)', optDuelE: 'Energiatárgy, ha az energia legfeljebb (%)', optDuelMot: 'Legkisebb párbajmotiváció (%) – alatta motivációs tárgyat használ',
     optDuelMotOut: 'Ha alacsony a motiváció, és nincs tárgy', outDuelOn: 'Párbajozzon tovább',
     optDuelAuto: 'Ha nincs használható bepipált tárgy, a táska legerősebb megfelelő tárgyát használja',
     secLose: 'Szándékos vereség', loseHint: 'A megadott számú párbaj után a következő néhányat a vesztes szettben vívja. A két számot a script megjegyzi, újratöltés után is megmaradnak (üresen: 12 párbaj, utána 4 vereség).',
@@ -6713,6 +6848,7 @@ tabJobs: 'Jobs', tabItems: 'Items', tabSets: 'Sets', tabCfg: 'Settings', tabStat
     optDDuel: 'Párbajok között', duelDelayHint: 'Az átöltözés és a tárgyhasználat késleltetése: Beállítások → Véletlenszerű késleltetés.',
     duelStatLine: '{0} párbaj · {1} győzelem · {2} XP', lblDuelMot: 'Párbajmotiváció', btnResetDuelStats: 'Párbajstatisztika nullázása',
     dst_idle: 'Tétlen', dst_fight: 'Párbajozik', dst_cooldown: 'Nincs elérhető bandita', dst_item: 'Tárgyat használ', dst_wait: 'Várakozik', dst_regen: 'Visszatöltődésre vár', dst_pause: 'Rövid szünet', dst_stopped: 'Leállítva',
+    duelNotReady: 'a bandita még nem áll készen – újra 2 mp múlva ({0}. próba)', duelNotReadyLog: '{0} A bot 2 másodpercenként újrapróbálja.',
     duelStarted: 'Párbaj elindítva.', duelStopped: 'Párbaj leállítva.',
     duelWin: '#{0} győzelem: {1}{2}', duelLoss: '#{0} vereség: {1}{2}', duelLoseTag: ' (vesztes szett)',
     duelErr: 'Hiba a párbajnál: {0}. Újrapróbálás {1} múlva.', duelErrShort: 'hiba után', duelTooMany: 'Túl sok hiba egymás után, a párbaj leállt. {0}',
